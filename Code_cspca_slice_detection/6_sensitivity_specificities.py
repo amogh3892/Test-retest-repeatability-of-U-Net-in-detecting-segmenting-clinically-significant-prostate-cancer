@@ -1,0 +1,217 @@
+from rpy2.robjects import DataFrame, FloatVector, IntVector
+from rpy2.robjects.packages import importr
+from rpy2 import robjects as ro
+from rpy2.robjects import pandas2ri
+pandas2ri.activate()
+from sklearn.metrics import roc_auc_score 
+
+from sklearn.decomposition import PCA
+
+from collections import namedtuple
+import numpy as np
+import pandas as pd 
+import pickle
+from sklearn.metrics import roc_auc_score,roc_curve,auc
+
+import matplotlib.pyplot as plt 
+plt.rcParams.update({'font.size': 20})
+import matplotlib.animation as animation
+import os 
+
+import scipy.stats
+
+import sys 
+sys.path.append(fr"..\Code_general")
+from dataUtil import DataUtil 
+from machineLearningUtil import PerformanceMetrics
+
+def mean_confidence_interval(data, confidence=0.95):
+    a = 1.0 * np.array(data)
+    n = len(a)
+    m, se = np.mean(a), scipy.stats.sem(a)
+    h = se * scipy.stats.t.ppf((1 + confidence) / 2., n-1)
+    return m, m-h, m+h
+
+
+def getIcc31(data1,data2):
+
+    """
+    data1 : First set of points
+    data2 : Second set of points
+    Get icc(3,1) for the two distributions with confidence internval
+    """
+
+    d1 = data1
+    d2 = data2
+
+    assert len(d1) == len(d2)
+
+    d = np.column_stack((d1,d2))
+    ddf = pd.DataFrame(d)
+    rdf = pandas2ri.py2ri(ddf)
+
+    irr = importr("irr")
+
+    d = irr.icc(rdf,model='twoway',type='consistency',unit = "single",conf_level = 0.95)
+
+
+    ci1 = d[13][0]
+    ci2 = d[14][0]
+
+    return (d[6][0], ci1, ci2)
+
+
+def getAUC(ytrue,ypred):
+
+    """
+    ytrue : Ground-truth values 
+    ypred : Predictions by the network/ ML algorithm 
+    AUC with condiference intervals
+    
+    """
+    ytrue = np.concatenate((ytrue, ytrue), axis=0)
+    ypred = np.concatenate((ypred, ypred), axis=0)
+
+    rpackage_pROC = importr('pROC')
+    rpackage_base = importr('base')
+    rpackage_psych = importr('psych')
+
+    #  2000 stratified bootstrap replicates
+    r_rocobj = rpackage_pROC.roc(ytrue, ypred)
+
+    AUC = r_rocobj[8][0]
+
+    r_ci = rpackage_pROC.ci(r_rocobj, x="best")
+
+    
+    return r_ci[1],r_ci[0],r_ci[2]
+
+
+def populateTestResults(models,inputfolder,outputfilename,cvsplits=3):
+        
+    """
+    models : Different models for which sensitivity and specificity has to be calculated. 
+    inputfolder : path to model checkpooints 
+    outputfilename : output path 
+    cvsplits : k- fold cross validation. 
+    """
+
+    output = [] 
+     
+    for model in models:
+        df = None
+        for cv in range(cvsplits):
+            
+
+            df1 = pd.read_csv(fr"{inputfolder}\{model}_1_{cv}\predictions.csv",index_col=0)
+            df2 = pd.read_csv(fr"{inputfolder}\{model}_2_{cv}\predictions.csv",index_col=0)
+
+            df1 = df1[df1["Phase"]!="val"]
+            df2 = df2[df2["Phase"]!="val"]
+
+            df1 = df1.rename(columns={'Pred': fr'Pred_{cv}'})
+            df2 = df2.rename(columns={'Pred': fr'Pred_{cv}'})
+
+            dfcv = df1.merge(df2, on=["FileName","True","Phase"])
+
+            df = dfcv if df is None else df.merge(dfcv,on=["FileName","True","Phase"])
+
+        df["Pred_x"] = df["Pred_0_x"] + df["Pred_1_x"] + df["Pred_2_x"]  
+        df["Pred_y"] = df["Pred_0_y"] + df["Pred_1_y"] + df["Pred_2_y"]  
+
+        ppred1 = df[(df["Phase"]=="test1")|(df["Phase"]=="test2")]["Pred_x"].values
+        ppred2 = df[(df["Phase"]=="test1")|(df["Phase"]=="test2")]["Pred_y"].values
+
+        ppred1_auc = df[(df["Phase"]=="test1")]["Pred_x"].values
+        ppred2_auc = df[(df["Phase"]=="test2")]["Pred_y"].values
+
+        ptrue1 = df[(df["Phase"]=="test1")]["True"].values
+        ptrue2 = df[(df["Phase"]=="test2")]["True"].values
+
+        picc31,pci1,pci2 = getIcc31(ppred1,ppred2)
+        p1auc,p1c1,p1c2 = getAUC(ptrue1,ppred1_auc)
+        p2auc,p2c1,p2c2 = getAUC(ptrue2,ppred2_auc)
+
+        picc31,pci1,pci2 = getIcc31(ppred1,ppred2)
+        p1auc,p1c1,p1c2 = getAUC(ptrue1,ppred1_auc)
+        p2auc,p2c1,p2c2 = getAUC(ptrue2,ppred2_auc)
+
+        
+        pm1 = PerformanceMetrics(ptrue1,ppred1_auc)
+        pm2 = PerformanceMetrics(ptrue2,ppred2_auc)
+
+        output.append((model,f"{str(round(p1auc, 2))} \
+        ({ str(round(p1c1, 2))}-{ str(round(p1c2, 2))})",f"{ str(round(p2auc, 2))}({ str(round(p2c1, 2))}-{ str(round(p2c2, 2))})", \
+        f"{ str(round(picc31, 2))}({ str(round(pci1, 2))}-{ str(round(pci2, 2))})", f"{str(round(pm1.accuracy,2))}",f"{str(round(pm1.sensitivity,2))}",f"{str(round(pm1.specificity,2))}", \
+           f"{str(round(pm2.accuracy,2))}", f"{str(round(pm2.sensitivity,2))}",f"{str(round(pm2.specificity,2))}"))
+
+
+    df = pd.DataFrame(output,columns=["Model","AUC1","AUC2","ICC","Accuracy1","Sensitivity1","Specificity1","Accuracy2","Sensitivity2","Specificity2"])
+
+    DataUtil.mkdir(fr"outputs\results")
+    df.to_csv(fr"outputs\results\{outputfilename}_holdout_sen_spec.csv",index=None)
+
+
+def populateCrossValAUC(models,inputfolder,outputfilename,cvsplits=3):
+
+    output = [] 
+    columns = []
+
+    for i,model in enumerate(models):
+        row = []
+        
+        pred1 = [] 
+        true1 = [] 
+        pred2 = [] 
+        true2 = [] 
+
+        for cv in range(cvsplits):
+
+            df1 = pd.read_csv(fr"{inputfolder}\{model}_1_{cv}\predictions.csv",index_col=0)
+            df2 = pd.read_csv(fr"{inputfolder}\{model}_2_{cv}\predictions.csv",index_col=0)
+
+            df1 = df1[df1["Phase"]=="val"]
+            df2 = df2[df2["Phase"]=="val"]
+
+            pred1.extend(df1["Pred"].values)
+            true1.extend(df1["True"].values)
+
+            pred2.extend(df2["Pred"].values)
+            true2.extend(df2["True"].values)
+
+        p1auc,p1c1,p1c2 = getAUC(true1,pred1)
+        p2auc,p2c1,p2c2 = getAUC(true2,pred2)
+
+        pm1 = PerformanceMetrics(true1,pred1)
+        pm2 = PerformanceMetrics(true2,pred2)
+    
+        row.extend((model,f"{str(round(p1auc, 2))} \
+        ({ str(round(p1c1, 2))}-{ str(round(p1c2, 2))})",f"{ str(round(p2auc, 2))}({ str(round(p2c1, 2))}-{ str(round(p2c2, 2))})", \
+        f"{str(round(pm1.accuracy,2))}",f"{str(round(pm1.sensitivity,2))}",f"{str(round(pm1.specificity,2))}", \
+           f"{str(round(pm2.accuracy,2))}", f"{str(round(pm2.sensitivity,2))}",f"{str(round(pm2.specificity,2))}"))
+
+        if i == 0:
+            columns.extend(["Model","AUC1","AUC2","Accuracy1","Sensitivity1","Specificity1","Accuracy2","Sensitivity2","Specificity2"])
+
+        output.append(tuple(row))
+
+
+    df = pd.DataFrame(output,columns=columns)
+
+    DataUtil.mkdir(fr"outputs\results")
+
+    df.to_csv(fr"outputs\results\{outputfilename}_cv_sens_spec.csv",index=None)
+
+
+if __name__ == '__main__':
+
+    # Saves the sensitivity and specificity of the model
+
+    dataset = "cspca" 
+    models = ["unet"]
+    outputfilename = fr"{dataset}_unet_results"
+
+    inputfolder = fr"modelcheckpoints\{dataset}"
+
+    populateTestResults(models,inputfolder,outputfilename)
+    populateCrossValAUC(models,inputfolder,outputfilename,cvsplits=3)
